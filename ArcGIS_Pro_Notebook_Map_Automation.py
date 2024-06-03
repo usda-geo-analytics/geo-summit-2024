@@ -4,14 +4,16 @@
 ############################################################
 
 # Replace the full folder path below with the path to the folder that contains
-# one or more Excel files that include Primary county FIPS codes.
+# one or more Excel files that include Primary county FIPS or Tribal codes.
 # (Do not include the name of an Excel file itself, ONLY THE CONTAINING FOLDER)
 # The folder may have one OR MORE Excel files, and the files may contain multiple sheets.
 # One map will be generated per sheet per Excel file (i.e., a folder containing two
 # Excel files with three sheets each will produce six maps).
 # Be sure to include the leading and trailing double quotes!
+# Update 4/24/24: If TRIBAL maps are being generated, the script produced one map 
+# PER EXCEL FILE rather than one map per sheet in each excel file.
 
-input_folder = r"C:\Users\misti.wudtke\OneDrive - USDA\PROJECTS\FSA_AutoMap_v1_2023Sept\Input_XLSXs"
+input_folder = r"C:\Users\misti.wudtke\OneDrive - USDA\PROJECTS\FSA_AutoMap_v3_100Automated\Input_XLSXs"
 
 
 # If you want to script to delete all files in the output folders
@@ -31,6 +33,7 @@ del_prior_outputs = True
 import arcpy
 import os
 import shutil
+import sys
 import pandas as pd
 
 ############################################################
@@ -44,34 +47,10 @@ def print_message(message):
 
 ############################################################
 
-# Make an output folder to store output file types
-def make_folders(output_folder):
-
-    # Define the full path string
-    output_path = os.path.join(input_folder, output_folder)
-    
-    # If the output folder already exist, do some checking:
-    if os.path.exists(output_path):
-        
-        # If we are supposed to delete prior outputs, do that,
-        # then re-make the folder
-        if del_prior_outputs:
-            shutil.rmtree(output_path)
-            os.mkdir(output_path)
-    
-    # Otherwise if folder do NOT already exist, just make it!
-    else:
-        os.mkdir(output_path)
-        
-    # Ship the full output path back to the rest of the script
-    return output_path
-
-        
-############################################################
-
 # In the current map in the current project open in ArcGIS Pro,
-# Get the service URL of the layer named "US Counties"
-def get_counties():
+# get the layer objects for US Counties, Counties including
+# water areas (direct from Census) and Tribal Lands
+def get_layers():
 
     # Get the current project
     current_project = arcpy.mp.ArcGISProject("CURRENT")
@@ -81,23 +60,39 @@ def get_counties():
 
     # Get the layer in the map named "US Counties"
     counties_layer = main_map.listLayers("US Counties")[0]
+    
+    # Get the layer in the map named "Tribal Lands"
+    tribal_layer = main_map.listLayers("Tribal Lands")[0]
+    
+    # Get the layer in the map named "US Counties Water"
+    water_layer = main_map.listLayers("US Counties Water")[0]
+    
+    print_message("Found the layers in the map")
 
-    # Print status message
-    print_message("Found US Counties layer in Main Map")
+    # Send both layer objects back to the rest of the script
+    return [counties_layer, tribal_layer, water_layer]
+        
 
-    # Return the variable "counties_layer" for use
-    # in the rest of the script
-    return counties_layer
+############################################################
+
+# Just in case anything has been randomly selected in any of the layers,
+# Clear anything currently selected
+def clear_all(map_layers):
+    
+    for map_layer in map_layers:
+        
+        arcpy.management.SelectLayerByAttribute(map_layer, "CLEAR_SELECTION")
         
 
 ############################################################
 
 # Build queries to select either Primary, Contiguous or Both counties
-def build_queries(counties_layer):
+def build_queries(in_layer):
 
     # Add the appropriate field delimiters to the field name
     # Proper delimiter depends on file format so we do it this way
-    delimited = arcpy.AddFieldDelimiters(counties_layer, "CLASS")
+    # (When this process transitions to using services things won't break)
+    delimited = arcpy.AddFieldDelimiters(in_layer, "CLASS")
 
     primary_query = f"{delimited} = 'Primary'"
 
@@ -110,22 +105,89 @@ def build_queries(counties_layer):
 
 ############################################################
 
-# This should only need to be called once.
-# The output will be a dictionary with map names as the key
-# and a list of the primary county fips codes as the values.
-def get_fips(input_folder):
+# Have reconfigured the script to work to generate both tribal
+# and non-tribal maps. Data for tribal maps is usually received in 
+# a slightly different format: 1 map per excel file vs 1 map per excel sheet.
+# Here we check whether the current script run is for tribal maps;
+# if it is, reprocess the excel dictionary to work on a per/excel basis.
+def check_for_tribal(fips_dict, excel_files):
+    
+    # Get list of excel files with the word "tribal" in the file name
+    # (This is how we make the determination of whether this is a tribal run)
+    tribal_files = [ef for ef in excel_files if "tribal" in ef.lower()]
+
+    # If there's at least one file with the word "tribal" in the name,
+    # continue with additional logic
+    if tribal_files:
+
+        # The script isn't set up to process a mix of tribal and non-tribal maps
+        # So, confirm that, if there's ONE tribal file, ALL the files are tribal
+        if not len(excel_files) == len(tribal_files):
+
+            # If it's a mix, give the user a warning to divy up the files
+            # and start the script over; exit script early after message.
+            print("""
+            \n\tAwe crap; it looks like there's a mix of tribal 
+            and non-tribal excel files in the input folder.
+            Since tribal and non-tribal are processed differently by the script,
+            There needs to be only ALL tribal or ALL non-tribal excel files 
+            in the folder for a given script run. Please fix, then run again!\n
+            (Note: Tribal excel files must have the word "tribal" in the file name;
+            non-tribal excel files must not have it.)
+            """)
+            print("\tExiting now! :)\n")
+            sys.exit()
+
+        # Assuming it's all-tribal-all-the-time, go ahead and reprocess dictionary
+        tribal_dict = {}
+        
+        # Key values in original dict are composed of excel file name + sheet name;
+        # since the map is generated per excel we only need the excel file name,
+        # so split the current key where it was concatenated previously by "__"
+        for k, val in fips_dict.items():
+            tk = k.split("__")[0]
+            
+            # Then for all values in the dict where the key excel file name is the same,
+            # smash all the values together in one total list:
+            # Add the key/val pair to the new tribal dict if it isn't already in it...
+            if not tk in tribal_dict:
+                tribal_dict[tk] = val
+            # If the key has already been added...
+            else:
+                # ...loop through values and append to current list of values
+                for v in val:
+                    tribal_dict[tk].append(v)
+                    
+        # Return the reprocessed dictionary and "True" for whether this is a tribal run
+        return [tribal_dict, True]
+    
+    # If this isn't a tribal run, just return the original dict pluse "False" for tribal run
+    else:
+        return [fips_dict, False]
+
+
+############################################################
+
+# This is called once per script run.
+# This function looks through the input folder (the only script parameter),
+# assembles a list of the excel files in it, then extract the first column of data
+# in each sheet of the excel file and smashes it into a list as the value of a dictionary.
+# (first column of data is usually county fips codes but may be tribal codes for tribal maps)
+# One key/value pair in the dictionary equals one output map.
+def get_fips():
     
     # Get a list of all files in the folder
     file_list = os.listdir(input_folder)
 
-    # Filter the list to include only Excel files
-    excel_files = [file for file in file_list if file.endswith('.xlsx')]
-    
     # Dictionary to store the data
     fips_dict = {}
+    
+    # Filter the list to include only Excel files
+    excel_files = [file for file in file_list if file.endswith('.xlsx')]
 
     # Iterate through Excel files
     for excel_file in excel_files:
+
         file_path = os.path.join(input_folder, excel_file)
 
         # Read all sheets in the Excel file
@@ -148,102 +210,195 @@ def get_fips(input_folder):
             # Chop off the .xlsx extension and replace underscores with spaces
             excel_title = excel_file.rsplit(".", 1)[0].replace("_", " ")
             sheet_title = sheet_name.replace("_", " ")
-            
+
             # Use both title of Excel document and sheet name
             # to build unique map title
-            key = excel_title + " " + str(sheet_title)
+            key = excel_title + "__" + str(sheet_title)
 
             # Add key-value pair to the dictionary
             fips_dict[key] = values
-    
-    # Print status message
-    print_message("\nFinished generating dictionary of map titles and county fips code lists")
-    
-    return fips_dict
+            
+    # Check if this is a tribal session
+    # And reprocess dict to convert to tribal if it is
+    fips_stuff = check_for_tribal(fips_dict, excel_files)
+
+    print_message("\nFinished generating dictionary of map titles and values lists")
+
+    # Send the stuff back whence it was called
+    return fips_stuff
 
     
 ############################################################
 
-#  This should be called once per map layout.
-#  After the map is exported, flip all the counties back to "Not Selected"
-#  We don't want selected counties from previous calls impinging on current call.
+# Make an output folder to store output file types
+def make_folders(folder_names):
 
+    # Empty list to store all full file paths (currently only 2)
+    full_paths = []
+    
+    # Iterate through input folder names
+    for folder_name in folder_names:
+
+        # Define the full path string
+        full_path = os.path.join(input_folder, folder_name)
+
+        # If the output folder already exist, do some checking:
+        if os.path.exists(full_path):
+
+            # If we are supposed to delete prior outputs, do that,
+            # then re-make the folder
+            if del_prior_outputs:
+                shutil.rmtree(full_path)
+                os.mkdir(full_path)
+
+        # Otherwise if folder do NOT already exist, just make it!
+        else:
+            os.mkdir(full_path)
+            
+        # Add new full path to list to be returned
+        full_paths.append(full_path)
+
+    # Ship the full output path back to the rest of the script
+    return full_paths
+
+        
+############################################################
+
+#  This should be called once per map layout
 #  Update cursor loops through all counties;
 #  For any row with a matching value in the current get_fips key/value pair,
 #  flip the Class attribute to "Primary"
-def code_primary(counties_layer, fips_list):
+def code_primary(map_layers, fips_list, id_field):
 
-    #  Fields for update cursor
-    cursor_fields = ["FIPS_C", "CLASS", "ObjctID"]
-    
-    # Run through the cursor and code all counties in the fips list as Primary
-    with arcpy.da.UpdateCursor(counties_layer, cursor_fields) as update_cursor:
-        for row in update_cursor:
-            if row[0] in fips_list:
-                row[1] = "Primary"
-                row[2] = 1
-                update_cursor.updateRow(row)
+    for map_layer in map_layers:
         
-    # Print status message
-    print_message("Finished coding Primary counties")
-        
+        #  Fields for update cursor
+        cursor_fields = [id_field, "CLASS"]
 
+        # Run through the cursor and code all counties in the fips list as Primary
+        with arcpy.da.UpdateCursor(map_layer, cursor_fields) as update_cursor:
+            for row in update_cursor:
+                if row[0] in fips_list:
+                    row[1] = "Primary"
+                    update_cursor.updateRow(row)
+
+    print_message("\tFinished coding Primary counties")
+        
+        
 ############################################################
 
-#  This should also be called once per map layout.
-#  Select all primary counties; select all counties adjacent to primary;
-#  Flip the class attribute to "Contiguous"
-#  Additional senanigans: apply 5-mile buffer; select all additional counties;
-#  Flip Class attribute to "Countiguous"; may need to check for any counties
-#  selected that are within 5 miles but NOT contiguous, NOT across water 
-def code_contiguous(counties_layer, key, queries, use_buffer, maps_to_check):
-    
+# Called once per map layout. Select all primary counties; 
+# select all counties adjacent to primary; flip the class attribute to "Contiguous"
+def code_contiguous(primary, contiguous, query):
+
     # Name for new Primary counties only layer
-    primary_counties = "Primary Counties"
-    
-    # Make Feature Layer for use with intersect GP tool
-    arcpy.management.MakeFeatureLayer(counties_layer, primary_counties, queries[0])
-    
-    # Select all counties from original all counties layer that intersect primary counties
-    # If use_buffer is True, the 5-mile rule will be implemented
-    if use_buffer:
-        arcpy.management.SelectLayerByLocation(counties_layer, "WITHIN_A_DISTANCE_GEODESIC", primary_counties, "5 Miles")
-    
-    # If use_buffer is False, NO 5-mile rule will be implemented
-    else:
-        arcpy.management.SelectLayerByLocation(counties_layer, "INTERSECT", primary_counties)
-    
-    # All intersecting counties, including primary counties, are selected;
-    # We do not want to re-code Primary counties so remove them from selection
-    arcpy.management.SelectLayerByAttribute(counties_layer, "REMOVE_FROM_SELECTION", queries[0])
-    
-    # Calculate all selected counties to "Contiguous"
-    arcpy.management.CalculateField(counties_layer, "CLASS", "'Contiguous'")
-    arcpy.management.CalculateField(counties_layer, "ObjctID", "0")
-    
-    # Count the number of counties coded as contiguous
-    contiguous_count = arcpy.management.GetCount(counties_layer)[0]
-    
-    # TO-DO
-    maps_to_check[key].append(int(contiguous_count))
-    
-    # Delete temp layer for only Primary counties
-    arcpy.management.Delete(primary_counties)
-    
-    # Print status message
-    if use_buffer:
-        print_message("Finished coding Contiguous counties with 5mi buffer")
-    else:
-        print_message("Finished coding Contiguous counties")
+    primary_features = "Primary Features (Temp)"
 
+    # Make Feature Layer for use with intersect GP tool
+    arcpy.management.MakeFeatureLayer(primary, primary_features, query)
+
+    # Use Select by Location to select counties from the counties layer
+    # that are contiguous to primary features (whether primary is in county or tribal layer)
+    # Current policy does not provide for the possibility of "contiguous tribal areas";
+    # If that changes, this section will need to be reworked
+    arcpy.management.SelectLayerByLocation(contiguous, "INTERSECT", primary_features)
+
+    # If primary features are also counties, we do not want to re-code them as contiguous
+    # in next step; remove anything currently coded as "primary" from selection
+    arcpy.management.SelectLayerByAttribute(contiguous, "REMOVE_FROM_SELECTION", query)
+
+    # Calculate all selected counties to "Contiguous"
+    arcpy.management.CalculateField(contiguous, "CLASS", "'Contiguous'")
+
+    # Clear selected features from permanent counties layer
+    arcpy.management.SelectLayerByAttribute(contiguous, "CLEAR_SELECTION")
+
+    # Delete temp primary-only counties layer
+    arcpy.management.Delete(primary_features)
+
+    print_message("\tFinished coding Contiguous counties")
+    
     
 ############################################################
 
-#  Not sure if this is going to make use of map series or not
-#  Literally just zoom to map extent in layout template, populate title, export
-def export_map(counties_layer, key, queries, output_folders, use_buffer):
+# We have done it! The holy grail of Secretarial Disaster Designation maps!!!
+# At this point, contiguous counties are already coded in the Census (with water) layer;
+# Now we need to transfer that coding to the counties with water removed,
+# THEN remove the "contiguous" coding from any counties where the non-water portions
+# are separated by x distance (here assumed to be 5 miles)
+def modify_contiguous(map_layers, queries):
     
-    arcpy.env.workspace = output_folders[0]
+    water = map_layers[2]
+    non_water = map_layers[0]
+
+    # STEP 1: We already coded the non-water PRIMARY counties for cartographic purposes,
+    # but the non-water layer has no counties coded as contiguous yet.
+    # We need them coded as contiguous. Compare FIPS and code everything that is
+    # CURRENTLY coded as contiguous in the water layer as contiguous in the non-water layer
+    
+    # Get the list of FIPS values for all the contiguous counties in water layer
+    contiguous_fips = [row[0] for row in arcpy.da.SearchCursor(water, ["FIPS_C"], queries[1])]
+
+    # Use that list of FIPS to update the counties in the non-water layer
+    with arcpy.da.UpdateCursor(non_water, ["FIPS_C", "CLASS"]) as update_cursor:
+        for row in update_cursor:
+            if row[0] in contiguous_fips:
+                row[1] = "Contiguous"
+                update_cursor.updateRow(row)
+                
+    # STEP 2: We now have ALL the correct counties coded as Contiguous, plus (possibly)
+    # ridiculous counties like something across a Great Lake from a primary county.
+    # Not a problem! We just need to remove some counties from Contiguous.
+
+    # Make a layer of all non-water Primary counties
+    prime_carto = "Primary Carto Counties (Temp)"
+    arcpy.management.MakeFeatureLayer(map_layers[0], prime_carto, queries[0])
+
+    # Make a layer of all non-water Primary Tribal areas
+    prime_tribal = "Primary Tribal Counties (Temp)"
+    arcpy.management.MakeFeatureLayer(map_layers[1], prime_tribal, queries[0])
+
+    # Make a layer of all non-water Contiguous counties
+    contig_carto = "Contiguous Carto Counties (Temp)"
+    arcpy.management.MakeFeatureLayer(map_layers[0], contig_carto, queries[1])
+    
+    # Intersect non-water Primary with non-water Contigous, using "WITHIN_A_DISTANCE_GEODESIC"
+    # Value used will depend on outcome of meeting tomorrow. Maybe 5 miles? 10 miles?
+    arcpy.management.SelectLayerByLocation(contig_carto, "WITHIN_A_DISTANCE_GEODESIC", prime_carto, "5 Miles")
+
+    arcpy.management.SelectLayerByLocation(contig_carto, "WITHIN_A_DISTANCE_GEODESIC", prime_tribal, "5 Miles", "ADD_TO_SELECTION")
+
+    # Then just invert the selection... 
+    arcpy.management.SelectLayerByLocation(contig_carto, selection_type="SWITCH_SELECTION")
+    
+    # I previously just went straight from inverting the selection to updating features
+    # to "Not selected". However, if there is no difference, when you switch the selection,
+    # you are left with nothing at all selected, and the following update cursor iterates
+    # over THE WHOLE FEATURE SET. Takes forever and kinda dumb, since there is nothing to update.
+    
+    # So now we check whether there is anything left in this layer after switching selection...
+    still_selected = [row for row in arcpy.da.SearchCursor(contig_carto, ["CLASS"])]
+    
+    # ...if there is, go ahead and reset it to "Not Selected"
+    if still_selected:
+        
+        with arcpy.da.UpdateCursor(contig_carto, ["CLASS"]) as update_cursor:
+            for row in update_cursor:
+                row[0] = "Not Selected"
+                update_cursor.updateRow(row)
+            
+    # Delete all three temp layers w/queries
+    arcpy.management.Delete(prime_carto)
+    arcpy.management.Delete(prime_tribal)
+    arcpy.management.Delete(contig_carto)
+
+
+############################################################
+
+#  Literally just zoom to map extent in layout template, populate title, export
+def export_map(map_layer, map_title, query, pdf_folder):
+    
+    arcpy.env.workspace = pdf_folder
     
     # Get the current project
     current_project = arcpy.mp.ArcGISProject("CURRENT")
@@ -254,215 +409,151 @@ def export_map(counties_layer, key, queries, output_folders, use_buffer):
     # Get map frame layout element
     map_frame = layout.listElements("MAPFRAME_ELEMENT", "Main Map")[0]    
     
-    # Select counties currently coded as contiguous
-    arcpy.management.SelectLayerByAttribute(counties_layer, "NEW_SELECTION", queries[2])
-    
-    # Get extent of selected features to use
-    contiguous_extent = map_frame.getLayerExtent(counties_layer, True, True)
-    
-    # Apply extent to layout map frame
-    map_frame.camera.setExtent(contiguous_extent)
-    
-    # Clear selected features
-    arcpy.management.SelectLayerByAttribute(counties_layer, "CLEAR_SELECTION")
-    
-    # Zoom out a little so contiguous counties are not right up to the edge of the map frame
-    map_frame.camera.scale = map_frame.camera.scale * 1.2
-    
-    # from the current Excel map sheet or wherever it comes from
-    layout.listElements("TEXT_ELEMENT", "Title")[0].text = key
-    layout.listElements("TEXT_ELEMENT", "Subtitle")[0].text = key
-    
-    # **************************************************
-    # TO-DO (OPTIONAL): Add option in toolbox to choose between JPG or PDF export
-    # **************************************************
-    
-    # Export layout
-    # Add buffer to file output name if buffer has been implemented in script
-    if use_buffer:
-        layout.exportToPDF(os.path.join(output_folders[0], key + " 5mi buffer.pdf"), resolution=200)
-    
-    else:
-        layout.exportToPDF(os.path.join(output_folders[0], key + ".pdf"), resolution=200)
-    
-    # Print status message
-    if use_buffer:
-        print_message("Finished exporting the current map with 5mi buffer")
-    else:
-        print_message("Finished exporting the current map")
-    
-    
-############################################################
-
-# Export xlsx files to send wherever they need to go downstream
-# With future iterations of the workflow this will not be required
-def export_excel(counties_layer, key, queries, output_folders, use_buffer):
-    
-    arcpy.env.workspace = output_folders[1]
+    # Get map frame layout element
+    overview_frame = layout.listElements("MAPFRAME_ELEMENT", "Overview Map")[0]    
     
     # Select counties currently coded as either primary or contiguous
-    arcpy.management.SelectLayerByAttribute(counties_layer, "NEW_SELECTION", queries[2])
+    arcpy.management.SelectLayerByAttribute(map_layer, "NEW_SELECTION", query)
     
-    # Construct full file name for output dpf files
-    # Add buffer to file output name if buffer has been implemented in script
-    if use_buffer:
-        output_excel = key + " 5mi buffer.xlsx"
-        
-    else:
-        output_excel = key + ".xlsx"
+    # Get extent of selected features to use
+    selected_extent = map_frame.getLayerExtent(map_layer, True, True)
     
-    # Do the work - send exels to output folder
-    arcpy.conversion.TableToExcel(counties_layer, output_excel)
+    # Apply extent to layout map frame
+    map_frame.camera.setExtent(selected_extent)
     
     # Clear selected features
-    arcpy.management.SelectLayerByAttribute(counties_layer, "CLEAR_SELECTION")
+    arcpy.management.SelectLayerByAttribute(map_layer, "CLEAR_SELECTION")
     
-    # Print status message
-    if use_buffer:
-        print_message("Finished exporting the Excel files with 5mi buffer")
-    else:
-        print_message("Finished exporting the Excel files")
+    # Zoom out a little so extent counties are not right up to the edge of the map frame
+    map_frame.camera.scale = map_frame.camera.scale * 1.1
+    
+    # Zoom out a little so extent counties are not right up to the edge of the map frame
+    overview_frame.camera.scale = map_frame.camera.scale * 8
+    
+    # Populate the map title dynamic text using Excel file name or file name/sheet combo
+    layout.listElements("TEXT_ELEMENT", "Title")[0].text = map_title.split(".")[0]
+    layout.listElements("TEXT_ELEMENT", "Subtitle")[0].text = map_title.split(".")[0]
+    
+    # Export layout - can adjust resolution here manually if desired
+    layout.exportToPDF(os.path.join(pdf_folder, map_title), resolution=200)
+    
+    print_message("\tFinished exporting the current map")
+    
+    
+############################################################
+
+# Export excel files (previously dbf was used; just wtaf);
+# these are ingested downstream by some xlsm file to populate
+# excel reports, some word doc letter...someday, when we near our goal
+# of taking over the world, all of that will go away...
+def export_excel(map_layer, file_name, queries, excel_folder):
+    
+    arcpy.env.workspace = excel_folder
+
+    # Select counties currently coded as either primary or contiguous
+    arcpy.management.SelectLayerByAttribute(map_layer, "NEW_SELECTION", queries[2])
+
+    # Use Table to Excel GP tool to export
+    arcpy.conversion.TableToExcel(map_layer, file_name)
+
+    # Clear selected features
+    arcpy.management.SelectLayerByAttribute(map_layer, "CLEAR_SELECTION")
+
+    print_message("\tFinished exporting the Excel files")
     
 
 ############################################################
 
-#  Use field calc to reset all values in counties back to "Not Selected"
-#  Update: Calculate Field was throwing an error for which Esri had no solution,
-#  So switched to UpdateCursor instead. Still plenty zippy.
-def reset_class(counties_layer, queries, use_buffer):
+# Once both buffered and unbuffered maps and excel documents are exported,
+# reset the "CLASS" attribute to "Not Selected" for both county and tribal layers.
+# (This effectively resets symbology and labels for the entire map)
+def reset_class(map_layers, query):
     
-    if use_buffer:
-        current_query = queries[1]
-    else:
-        current_query = queries[2]
-    
-    with arcpy.da.UpdateCursor(counties_layer, ["CLASS", "ObjctID"], current_query) as update_cursor:
-        for row in update_cursor:
-            row[0] = "Not Selected"
-            row[1] = 0
-            update_cursor.updateRow(row)
+    # Loop happens 2x, once for counties once for tribal areas
+    for map_layer in map_layers:
         
-    # Print status message
-    if use_buffer:
-        print_message("Finished resetting CLASS attribute with 5mi buffer")
-    else:
-        print_message("Finished resetting CLASS attribute")
+        # Tried just calcing this field but it was throwing an error
+        # for which Esri had no help page, so just switched to cursor; still plenty zippy.
+        with arcpy.da.UpdateCursor(map_layer, ["CLASS"], query) as update_cursor:
+            for row in update_cursor:
+                row[0] = "Not Selected"
+                update_cursor.updateRow(row)
+
+    print_message("\tFinished resetting CLASS attribute")
     
 
 ############################################################
 
-def contiguous_subcall(counties_layer, key, output_folders, use_buffer, maps_to_check):
+# The meat and potatoes of the script--iterate through the dictionary of fips codes
+# (And possibly tribal codes) and create 2 maps + 2 excels 
+# (1 set buffered, 1 set not buffered) for each iteration.
+def iterate_maps(map_layers, fips_dict, tribal, queries, output_folders):
     
-    # Call to function to build the required SQL queries
-    queries = build_queries(counties_layer)
-
-    # Call to function to code all counties contiguous to Primary counties as such
-    code_contiguous(counties_layer, key, queries, use_buffer, maps_to_check)
-
-    # Call to function to export map
-    export_map(counties_layer, key, queries, output_folders, use_buffer)
-
-    # Call to function to export xlsx files
-    export_excel(counties_layer, key, queries, output_folders, use_buffer)
-
-    # Call to function to reset class
-    reset_class(counties_layer, queries, use_buffer)
-    
-
-############################################################
-
-#  This should mostly consist of iterating through our FIPS dictionary
-#  And calling code_primary, code_contiguous and export_map for each key/value pair
-def iterate_maps(counties_layer, fips_dict):
-    
-    maps_to_check = {}
-    
-    # Provide string names for our two output folders
-    output_pdfs = make_folders("Output PDFs")
-    output_excels = make_folders("Output Excels")
-    
-    # Stuff both in a list for easier passing to various functions
-    output_folders = (output_pdfs, output_excels)
-    
-    # "key" is every Excel sheet (which will be a map) and "value" is list of 5-digit FIPS codes
+    # For non-tribal maps, "key" is every excel sheet and "value" is list of 5-digit FIPS codes
+    # for tribal maps, "key" is every excel file title and "value" is list of FIPS + tribal codes
     for key, value in fips_dict.items():
         
-        maps_to_check[key] = []
-
-        # Print status message
         print_message(f"\nWorking on map title '{key}'")
 
-        # Call to function to iterate through counties layer and flip Class attr of all Primary counties
-        code_primary(counties_layer, value)
+        # If this is a tribal map, 2nd call to code Primary tribal areas as well
+        if tribal:
+            
+            code_primary([map_layers[1]], value, "AIANNH")
 
-        # First call to contiguous sub-fuction, iterates through sub-processes WITH 5mi buffer
-        contiguous_subcall(counties_layer, key, output_folders, True, maps_to_check)
-        
-        # Second call to contiguous sub-fuction, iterates through sub-processes WITHOUT 5mi buffer
-        contiguous_subcall(counties_layer, key, output_folders, False, maps_to_check)
-    
-        # Print status message
+            # Call to function to code contiguous counties
+            code_contiguous(map_layers[1], map_layers[2], queries[0])
+
+            export_excel(map_layers[1], key + " TRIBAL.xlsx", queries, output_folders[1])
+
+        # Call to function to iterate through counties and code "CLASS" attribute as Primary
+        code_primary([map_layers[0], map_layers[2]], value, "FIPS_C")
+
+        # Call to function to code contiguous counties
+        code_contiguous(map_layers[2], map_layers[2], queries[0])
+
+        # Call to function to modify contiguous counties if necessary
+        modify_contiguous(map_layers, queries)
+
+        # Call to function to export the map layout as .pdf
+        export_map(map_layers[0], key + ".pdf", queries[2], output_folders[0])
+
+        # Call to function to export the associated excel file
+        export_excel(map_layers[0], key + ".xlsx", queries, output_folders[1])
+
+        # Call to function to reset CLASS attribute for both layers
+        reset_class(map_layers, queries[2])
+
         print_message(f"Finished map title '{key}'")
-        
-    return maps_to_check
     
 
-############################################################
-
-# Run through the dictionary we generated to check for maps
-# that may need to be adjusted manually.
-# For all these maps, the number of contiguous counties WITH
-# the 5mi boundary and the number contiguous counties WITHOUT
-# the buffer is 2 or more...so the buffer may apply to one
-# but not the other. Script cannot fix automatically yet.
-def find_manual_maps(maps_to_check):
-
-    print_message("\n\n****************************")
-    print_message("**** MAP OUTPUT REPORT: ****")
-    print_message("****************************\n")
-    
-    buffer_on = "\tContiguous counties with buffer ON:"
-    buffer_off = "\tContiguous counties with buffer OFF:"
-    
-    for k, v in maps_to_check.items():
-        if v[0] - v[1] >= 2:
-            print_message(f"** POSSIBLE MANUAL MAP: **\n{k}")
-            print_message(f"\tDifference buffered vs unbuffered")
-            print_message(f"\tcontiguous counties is 2 or more")
-            print_message(f"{buffer_on} {v[0]}")
-            print_message(f"{buffer_off} {v[1]}")
-            print_message(f"\tTotal difference: {v[0]-v[1]}\n")
-            
-        elif v[0] - v[1] == 1:
-            print_message(f"CHOOSE BUFFERED OR UNBUFFERED MAP:\n{k}")
-            print_message(f"{buffer_on} {v[0]}")
-            print_message(f"{buffer_off} {v[1]}\n")
-
-        else:
-            print_message(f"IDENTICAL MAPS:\n{k}")
-            print_message(f"{buffer_on} {v[0]}")
-            print_message(f"{buffer_off} {v[1]}\n")
-
-            
 ############################################################
 
 def do_the_work():
     
     # Call to function to get the counties layer
-    counties_layer = get_counties()
+    map_layers = get_layers()
+    
+    # Call to function to build the required SQL queries
+    queries = build_queries(map_layers[0])
 
+    # Call to function to clear any and all selections
+    clear_all(map_layers)
+
+    # Call to function to reset CLASS attribute for both layers
+    reset_class(map_layers, queries[2])
+    
     # Call to function to get all the fips codes from all the sheets in all the excel files in a folder
-    fips_dict = get_fips(input_folder)
+    fips_stuff = get_fips()
+    
+    # Provide string names for our two output folders
+    output_folders = make_folders(["Output PDFs", "Output Excels"])
 
     # Call to function to iterate fips_dict and export a single map
     # Various per-map functions are called from within this function
-    maps_to_check = iterate_maps(counties_layer, fips_dict)
+    iterate_maps(map_layers, fips_stuff[0], fips_stuff[1], queries, output_folders)
 
     # Print status message
     print_message("\nFinished generating all maps successfully")
-    
-    # Call to function to see whether any maps may need to be run semi-manually
-    find_manual_maps(maps_to_check)
     
     
 ################################################################################
@@ -472,4 +563,3 @@ def do_the_work():
 # Call to the MAIN OVERARCHING function from which all other functions are called
 # One call does it all...should make it easier to stuff in a toolbox later
 do_the_work()
-
